@@ -424,10 +424,14 @@ class VideoProcessor:
 
         recent = [
             inc for inc in incidents_db
-            if inc["track_id"] == t_id and (datetime.now() - datetime.fromisoformat(inc["timestamp"])).total_seconds() < 10
+            if inc["track_id"] == t_id and (datetime.now() - datetime.fromisoformat(inc["timestamp"])).total_seconds() < 30
         ]
         if recent:
             alert["incident_id"] = recent[0]["id"]
+            return
+
+        # Only create a persistent incident log entry when fall is CONFIRMED (immobility verified)
+        if alert["state"] != FallStateMachine.STATE_CONFIRMED_FALL:
             return
 
         incident = {

@@ -60,6 +60,10 @@ class FallDetectionPipeline:
 
         tracklet_data: Dict[int, Dict[str, Any]] = {}
         alerts: List[Dict[str, Any]] = []
+        now = time.time()
+        dt = getattr(self, "_last_frame_time", None)
+        frame_dt = (now - dt) if (dt is not None and 0.005 <= (now - dt) <= 0.5) else (1.0 / max(self.fps, 1.0))
+        self._last_frame_time = now
 
         for track in tracklets:
             t_id = track.track_id
@@ -84,15 +88,16 @@ class FallDetectionPipeline:
             track.in_occlusion_zone = in_zone
             track.occlusion_zone_name = zone_name
 
-            # Step 4: Compute Kinematic Features
+            # Step 4: Compute Kinematic Features with measured dt
             features = self.kinematics.extract_features(
                 keypoints_history=track.imputed_kps_history,
                 bbox_history=track.bbox_history,
-                occlusion_stats=occ_stats
+                occlusion_stats=occ_stats,
+                dt=frame_dt
             )
 
-            # Step 5: Advance State Machine
-            state, state_info = self.state_machine.step(track, features, occ_stats)
+            # Step 5: Advance State Machine with measured dt
+            state, state_info = self.state_machine.step(track, features, occ_stats, dt=frame_dt)
 
             tracklet_data[t_id] = {
                 "imputed_kps": imputed_kps,

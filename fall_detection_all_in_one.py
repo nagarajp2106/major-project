@@ -205,30 +205,34 @@ class OcclusionEngine:
 class KinematicExtractor:
     """
     Computes spine angle relative to floor, normalized velocities, accelerations,
-    and post-impact stillness metrics.
+    and post-impact stillness metrics with temporal smoothing and variable dt support.
     """
-    def __init__(self, fps: float = 30.0):
+    def __init__(self, fps: float = 30.0, smoothing_alpha: float = 0.65):
         self.fps = fps
-        self.dt = 1.0 / max(fps, 1.0)
+        self.default_dt = 1.0 / max(fps, 1.0)
+        self.smoothing_alpha = smoothing_alpha
 
     def extract_features(
         self,
         keypoints_history: List[np.ndarray],
         bbox_history: List[List[float]],
-        occlusion_stats: Dict[str, float]
+        occlusion_stats: Dict[str, float],
+        dt: Optional[float] = None
     ) -> Dict[str, float]:
-        if not keypoints_history:
+        if not keypoints_history or not bbox_history:
             return self._empty_features()
+
+        step_dt = dt if (dt is not None and 0.005 <= dt <= 0.5) else self.default_dt
 
         current_kps = keypoints_history[-1]
         current_bbox = bbox_history[-1]
 
         torso_angle = self.calculate_torso_angle(current_kps)
-        bbox_w = max(current_bbox[2] - current_bbox[0], 1.0)
-        bbox_h = max(current_bbox[3] - current_bbox[1], 1.0)
+        bbox_w = max(float(current_bbox[2] - current_bbox[0]), 1.0)
+        bbox_h = max(float(current_bbox[3] - current_bbox[1]), 1.0)
         aspect_ratio = float(bbox_w / bbox_h)
 
-        v_y, a_y, centroid_y = self.calculate_vertical_kinematics(keypoints_history, bbox_history)
+        v_y, a_y, centroid_y = self.calculate_vertical_kinematics(keypoints_history, bbox_history, step_dt)
         stillness_energy = self.calculate_stillness_energy(keypoints_history, window=15)
 
         # Compute angular collapse rate (degrees per second)
@@ -236,16 +240,16 @@ class KinematicExtractor:
         if len(keypoints_history) >= 2:
             prev_kps = keypoints_history[-2]
             prev_angle = self.calculate_torso_angle(prev_kps)
-            angular_vel = (prev_angle - torso_angle) * self.fps
+            angular_vel = max(0.0, float((prev_angle - torso_angle) / step_dt))
 
         return {
-            "torso_angle": float(torso_angle),
-            "angular_velocity": float(angular_vel),
-            "vertical_velocity": float(v_y),
-            "vertical_accel": float(a_y),
-            "aspect_ratio": float(aspect_ratio),
-            "stillness_energy": float(stillness_energy),
-            "centroid_y": float(centroid_y),
+            "torso_angle": float(np.nan_to_num(torso_angle, nan=90.0)),
+            "angular_velocity": float(np.nan_to_num(angular_vel, nan=0.0)),
+            "vertical_velocity": float(np.nan_to_num(v_y, nan=0.0)),
+            "vertical_accel": float(np.nan_to_num(a_y, nan=0.0)),
+            "aspect_ratio": float(np.nan_to_num(aspect_ratio, nan=0.4)),
+            "stillness_energy": float(np.nan_to_num(stillness_energy, nan=50.0)),
+            "centroid_y": float(np.nan_to_num(centroid_y, nan=0.0)),
             "bbox_height": float(bbox_h),
             "bbox_width": float(bbox_w)
         }
@@ -254,46 +258,82 @@ class KinematicExtractor:
         l_sh, r_sh = kps[5], kps[6]
         l_hip, r_hip = kps[11], kps[12]
 
-        mid_sh_x = (l_sh[0] + r_sh[0]) / 2.0
-        mid_sh_y = (l_sh[1] + r_sh[1]) / 2.0
-        mid_hip_x = (l_hip[0] + r_hip[0]) / 2.0
-        mid_hip_y = (l_hip[1] + r_hip[1]) / 2.0
+        sh_valid = (l_sh[2] > 0.25 and l_sh[0] > 0) or (r_sh[2] > 0.25 and r_sh[0] > 0)
+        hip_valid = (l_hip[2] > 0.25 and l_hip[0] > 0) or (r_hip[2] > 0.25 and r_hip[0] > 0)
 
-        dx = mid_sh_x - mid_hip_x
-        dy = mid_sh_y - mid_hip_y
+        if not (sh_valid and hip_valid):
+            nose = kps[0]
+            if nose[2] > 0.25 and hip_valid:
+                mid_sh_x, mid_sh_y = nose[0], nose[1]
+                mid_hip_x = (l_hip[0] + r_hip[0]) / 2.0 if (l_hip[0] > 0 and r_hip[0] > 0) else (l_hip[0] if l_hip[0] > 0 else r_hip[0])
+                mid_hip_y = (l_hip[1] + r_hip[1]) / 2.0 if (l_hip[1] > 0 and r_hip[1] > 0) else (l_hip[1] if l_hip[1] > 0 else r_hip[1])
+            else:
+                return 90.0
+        else:
+            if l_sh[2] > 0.25 and r_sh[2] > 0.25:
+                mid_sh_x = (l_sh[0] + r_sh[0]) / 2.0
+                mid_sh_y = (l_sh[1] + r_sh[1]) / 2.0
+            else:
+                mid_sh_x = l_sh[0] if l_sh[2] > 0.25 else r_sh[0]
+                mid_sh_y = l_sh[1] if l_sh[2] > 0.25 else r_sh[1]
+
+            if l_hip[2] > 0.25 and r_hip[2] > 0.25:
+                mid_hip_x = (l_hip[0] + r_hip[0]) / 2.0
+                mid_hip_y = (l_hip[1] + r_hip[1]) / 2.0
+            else:
+                mid_hip_x = l_hip[0] if l_hip[2] > 0.25 else r_hip[0]
+                mid_hip_y = l_hip[1] if l_hip[2] > 0.25 else r_hip[1]
+
+        dx = float(mid_sh_x - mid_hip_x)
+        dy = float(mid_sh_y - mid_hip_y)
 
         if abs(dx) < 1e-4 and abs(dy) < 1e-4:
             return 90.0
 
         angle_rad = np.arctan2(abs(dy), abs(dx) + 1e-6)
-        return float(np.degrees(angle_rad))
+        angle_deg = float(np.degrees(angle_rad))
+        return float(np.clip(angle_deg, 0.0, 90.0))
 
     def calculate_vertical_kinematics(
         self,
         kps_history: List[np.ndarray],
-        bbox_history: List[List[float]]
+        bbox_history: List[List[float]],
+        dt: float = 0.033
     ) -> Tuple[float, float, float]:
         if len(kps_history) < 2:
             current_kps = kps_history[-1]
-            torso_y = np.mean(current_kps[[5, 6, 11, 12], 1])
+            torso_y = self._extract_torso_y(current_kps)
             return 0.0, 0.0, float(torso_y)
 
-        y_coords = []
-        for kps in kps_history[-min(len(kps_history), 4):]:
-            torso_y = np.mean(kps[[5, 6, 11, 12], 1])
-            y_coords.append(torso_y)
+        recent_heights = [max(float(b[3] - b[1]), 30.0) for b in bbox_history[-min(len(bbox_history), 15):]]
+        norm_h = float(np.median(recent_heights)) if recent_heights else 100.0
 
-        current_bbox = bbox_history[-1]
-        norm_h = max(current_bbox[3] - current_bbox[1], 50.0)
+        raw_ys = [self._extract_torso_y(kps) for kps in kps_history[-min(len(kps_history), 4):]]
+        smoothed_ys = []
+        val = raw_ys[0]
+        for y in raw_ys:
+            val = self.smoothing_alpha * y + (1.0 - self.smoothing_alpha) * val
+            smoothed_ys.append(val)
 
-        v_now = (y_coords[-1] - y_coords[-2]) / (self.dt * norm_h)
-        if len(y_coords) >= 3:
-            v_prev = (y_coords[-2] - y_coords[-3]) / (self.dt * norm_h)
-            a_now = (v_now - v_prev) / self.dt
+        v_now = (smoothed_ys[-1] - smoothed_ys[-2]) / (max(dt, 0.005) * norm_h)
+
+        if len(smoothed_ys) >= 3:
+            v_prev = (smoothed_ys[-2] - smoothed_ys[-3]) / (max(dt, 0.005) * norm_h)
+            a_now = (v_now - v_prev) / max(dt, 0.005)
         else:
             a_now = 0.0
 
-        return float(v_now), float(a_now), float(y_coords[-1])
+        return float(v_now), float(a_now), float(smoothed_ys[-1])
+
+    def _extract_torso_y(self, kps: np.ndarray) -> float:
+        torso_pts = kps[[5, 6, 11, 12]]
+        valid = torso_pts[(torso_pts[:, 2] > 0.25) & (torso_pts[:, 1] > 0)]
+        if len(valid) > 0:
+            return float(np.mean(valid[:, 1]))
+        all_valid = kps[(kps[:, 2] > 0.2) & (kps[:, 1] > 0)]
+        if len(all_valid) > 0:
+            return float(np.mean(all_valid[:, 1]))
+        return 0.0
 
     def calculate_stillness_energy(self, kps_history: List[np.ndarray], window: int = 15) -> float:
         if len(kps_history) < 3:
@@ -305,17 +345,17 @@ class KinematicExtractor:
         for f in range(-sample_len + 1, 0):
             curr = kps_history[f]
             prev = kps_history[f - 1]
-            valid_mask = (curr[:, 0] > 0) & (prev[:, 0] > 0) & (curr[:, 2] > 0.2)
+            valid_mask = (curr[:, 0] > 0) & (prev[:, 0] > 0) & (curr[:, 2] > 0.25) & (prev[:, 2] > 0.25)
             if np.any(valid_mask):
                 diffs = np.linalg.norm(curr[valid_mask, :2] - prev[valid_mask, :2], axis=1)
-                displacements.append(np.mean(diffs))
+                displacements.append(float(np.mean(diffs)))
 
         return float(np.mean(displacements)) if displacements else 0.0
 
     def _empty_features(self) -> Dict[str, float]:
         return {
-            "torso_angle": 90.0, "vertical_velocity": 0.0, "vertical_accel": 0.0,
-            "aspect_ratio": 0.4, "stillness_energy": 100.0, "centroid_y": 0.0,
+            "torso_angle": 90.0, "angular_velocity": 0.0, "vertical_velocity": 0.0, "vertical_accel": 0.0,
+            "aspect_ratio": 0.4, "stillness_energy": 50.0, "centroid_y": 0.0,
             "bbox_height": 100.0, "bbox_width": 40.0
         }
 
@@ -409,7 +449,7 @@ class SimpleTracker:
 # ======================================================================================
 class FallStateMachine:
     """
-    Real-Time Fall State Machine with instant-trigger alerts on falling motion and impact.
+    Robust Multi-Stage Fall State Machine with dynamic descent tracking and ground immobility confirmation.
     """
     STATE_MONITORING = "MONITORING"
     STATE_RAPID_DESCENT = "RAPID_DESCENT"
@@ -422,15 +462,15 @@ class FallStateMachine:
     def __init__(
         self,
         fps: float = 30.0,
-        fall_velocity_thresh: float = 1.2,    # Highly sensitive to descent
-        flat_angle_thresh: float = 55.0,       # Any tilt below 55° is flagged
-        standing_angle_thresh: float = 70.0,
+        fall_velocity_thresh: float = 1.1,
+        flat_angle_thresh: float = 48.0,
+        standing_angle_thresh: float = 68.0,
         inactivity_sec: float = 1.5,
         pre_alert_sec: float = 2.0,
         stillness_energy_thresh: float = 25.0
     ):
         self.fps = fps
-        self.dt = 1.0 / max(fps, 1.0)
+        self.default_dt = 1.0 / max(fps, 1.0)
         self.fall_velocity_thresh = fall_velocity_thresh
         self.flat_angle_thresh = flat_angle_thresh
         self.standing_angle_thresh = standing_angle_thresh
@@ -442,61 +482,95 @@ class FallStateMachine:
         self,
         tracklet: Tracklet,
         features: Dict[str, float],
-        occlusion_stats: Dict[str, float]
+        occlusion_stats: Dict[str, float],
+        dt: Optional[float] = None
     ) -> Tuple[str, Dict[str, Any]]:
+        step_dt = dt if (dt is not None and 0.005 <= dt <= 0.5) else self.default_dt
+
         v_y = features.get("vertical_velocity", 0.0)
         angular_vel = features.get("angular_velocity", 0.0)
         angle = features.get("torso_angle", 90.0)
         aspect_ratio = features.get("aspect_ratio", 0.5)
         stillness = features.get("stillness_energy", 0.0)
-        in_occ_zone = tracklet.in_occlusion_zone
 
         current = tracklet.state
         next_state = current
         event_trigger = ""
 
-        # A REAL Fall requires a dynamic event (rapid descent or fast angular collapse)
-        # Normal lying down / sleeping on a bed has v_y ~= 0 and angular_vel ~= 0
-        is_dynamic_fall = (
-            v_y > self.fall_velocity_thresh or
-            (angular_vel > 35.0 and angle < self.flat_angle_thresh) or
-            (v_y > 0.6 and angle < self.flat_angle_thresh) or
-            (in_occ_zone and v_y > 0.8)
-        )
+        has_downward_shock = v_y > self.fall_velocity_thresh or (v_y > 0.7 and angular_vel > 30.0)
+        is_horizontal = (angle < self.flat_angle_thresh) or (aspect_ratio > 1.05)
+        is_upright = angle > self.standing_angle_thresh
 
-        if is_dynamic_fall:
-            next_state = self.STATE_FALL_DETECTED
+        # --- STATE 1: MONITORING ---
+        if current == self.STATE_MONITORING:
             tracklet.state_timer = 0.0
-            event_trigger = f"[!] FALL TRIGGERED! (Velocity: +{v_y:.2f} h/s, Angle: {angle:.1f}°)"
+            if has_downward_shock and not is_horizontal:
+                next_state = self.STATE_RAPID_DESCENT
+                tracklet.state_timer = 0.0
+                event_trigger = f"[!] RAPID DESCENT DETECTED (+{v_y:.2f} h/s)"
+            elif (has_downward_shock and is_horizontal) or (v_y > 0.65 and angle < self.flat_angle_thresh and angular_vel > 25.0):
+                next_state = self.STATE_FALL_DETECTED
+                tracklet.state_timer = 0.0
+                event_trigger = f"[!] FALL DETECTED (Velocity: +{v_y:.2f} h/s, Angle: {angle:.1f}°)"
 
+        # --- STATE 2: RAPID_DESCENT ---
+        elif current == self.STATE_RAPID_DESCENT:
+            tracklet.state_timer += step_dt
+            if is_horizontal:
+                next_state = self.STATE_FALL_DETECTED
+                tracklet.state_timer = 0.0
+                event_trigger = "[!] IMPACT: Person horizontal on ground"
+            elif is_upright and v_y < 0.2:
+                next_state = self.STATE_MONITORING
+                tracklet.state_timer = 0.0
+                event_trigger = "Controlled movement -> Monitoring"
+            elif tracklet.state_timer > 1.2:
+                next_state = self.STATE_MONITORING
+                tracklet.state_timer = 0.0
+
+        # --- STATE 3: FALL_DETECTED / IMPACT ---
         elif current in [self.STATE_FALL_DETECTED, self.STATE_IMPACT]:
-            tracklet.state_timer += self.dt
-            # Subject must be horizontal/flat (< flat_angle_thresh) to confirm fall
-            if angle < self.flat_angle_thresh or aspect_ratio > 1.1:
+            tracklet.state_timer += step_dt
+            if is_upright and v_y < -0.2:
+                next_state = self.STATE_MONITORING
+                tracklet.state_timer = 0.0
+                event_trigger = "Subject stood upright -> Recovered"
+            elif is_horizontal:
+                next_state = self.STATE_INACTIVITY_CHECK
+                event_trigger = "Verifying ground immobility..."
+            elif tracklet.state_timer > 2.0 and not is_horizontal:
+                next_state = self.STATE_MONITORING
+                tracklet.state_timer = 0.0
+
+        # --- STATE 4: INACTIVITY_CHECK / PRE_ALERT ---
+        elif current in [self.STATE_INACTIVITY_CHECK, self.STATE_PRE_ALERT]:
+            tracklet.state_timer += step_dt
+            if is_upright:
+                next_state = self.STATE_MONITORING
+                tracklet.state_timer = 0.0
+                event_trigger = "Subject recovered and stood upright"
+            elif is_horizontal:
                 if tracklet.state_timer >= self.inactivity_sec:
                     next_state = self.STATE_CONFIRMED_FALL
                     event_trigger = "[EMERGENCY] CONFIRMED EMERGENCY FALL ON GROUND"
                 else:
-                    next_state = self.STATE_FALL_DETECTED
-            elif angle > self.standing_angle_thresh:
-                # Subject stood back up or is upright
-                next_state = self.STATE_MONITORING
-                event_trigger = "Subject upright -> Reset"
+                    next_state = self.STATE_INACTIVITY_CHECK
+            else:
+                if tracklet.state_timer > (self.inactivity_sec + 1.0):
+                    next_state = self.STATE_MONITORING
+                    tracklet.state_timer = 0.0
 
+        # --- STATE 5: CONFIRMED_FALL ---
         elif current == self.STATE_CONFIRMED_FALL:
-            if angle > self.standing_angle_thresh and stillness > 20.0:
+            if is_upright and (stillness > 15.0 or v_y < -0.3):
                 next_state = self.STATE_MONITORING
-                event_trigger = "Subject upright and moving -> Reset"
-
-        elif current == self.STATE_MONITORING:
-            # Person is monitored normally.
-            # If lying down with no dynamic shock, they remain in peaceful MONITORING state
-            pass
+                tracklet.state_timer = 0.0
+                event_trigger = "Subject stood upright -> Reset to Monitoring"
 
         tracklet.state = next_state
         return next_state, {
-            "state_timer": tracklet.state_timer,
-            "countdown": max(0.0, self.inactivity_sec - tracklet.state_timer),
+            "state_timer": round(tracklet.state_timer, 2),
+            "countdown": max(0.0, round(self.inactivity_sec - tracklet.state_timer, 2)),
             "event_trigger": event_trigger
         }
 
@@ -784,6 +858,11 @@ class FallDetectionPipeline:
         tracklet_data: Dict[int, Dict[str, Any]] = {}
         alerts: List[Dict[str, Any]] = []
 
+        now = time.time()
+        dt = getattr(self, "_last_frame_time", None)
+        frame_dt = (now - dt) if (dt is not None and 0.005 <= (now - dt) <= 0.5) else (1.0 / max(self.fps, 1.0))
+        self._last_frame_time = now
+
         for track in tracklets:
             t_id = track.track_id
             curr_bbox = track.bbox_history[-1]
@@ -804,10 +883,11 @@ class FallDetectionPipeline:
             features = self.kinematics.extract_features(
                 keypoints_history=track.imputed_kps_history,
                 bbox_history=track.bbox_history,
-                occlusion_stats=occ_stats
+                occlusion_stats=occ_stats,
+                dt=frame_dt
             )
 
-            state, state_info = self.state_machine.step(track, features, occ_stats)
+            state, state_info = self.state_machine.step(track, features, occ_stats, dt=frame_dt)
 
             tracklet_data[t_id] = {
                 "imputed_kps": imputed_kps,
