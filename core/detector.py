@@ -47,6 +47,12 @@ class PoseDetector:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
+
+        if self.device == "cpu" and hasattr(torch, "set_num_threads"):
+            try:
+                torch.set_num_threads(min(4, os.cpu_count() or 4))
+            except Exception:
+                pass
             
         print(f"[PoseDetector] Loading {model_name} on device: {self.device}")
         self.model = YOLO(model_name)
@@ -69,6 +75,7 @@ class PoseDetector:
             source=frame,
             conf=self.conf_thresh,
             device=self.device,
+            imgsz=320,
             verbose=False
         )
 

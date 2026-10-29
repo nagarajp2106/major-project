@@ -85,19 +85,21 @@ export const EmergencyAlertModal: React.FC<EmergencyAlertModalProps> = ({
         {/* Content Body */}
         <div className="p-6 space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-            {/* Snapshot Preview */}
+            {/* Snapshot Preview (Mirrored to match selfie live camera view) */}
             <div className="rounded-xl overflow-hidden border border-slate-300 bg-slate-950 aspect-video flex items-center justify-center relative shadow-sm">
               {incident.snapshot_base64 ? (
                 <img
                   src={`data:image/jpeg;base64,${incident.snapshot_base64}`}
                   alt="Incident snapshot"
                   className="w-full h-full object-cover"
+                  style={{ transform: 'scaleX(-1)' }}
                 />
               ) : (
                 <img
                   src={`/api/snapshot?t=${Date.now()}`}
                   alt="Live Camera Snapshot"
                   className="w-full h-full object-cover"
+                  style={{ transform: 'scaleX(-1)' }}
                   onError={(e) => {
                     (e.target as HTMLImageElement).src = `/api/stream?t=${Date.now()}`;
                   }}

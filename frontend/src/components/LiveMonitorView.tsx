@@ -33,6 +33,10 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadProgress, setUploadProgress] = React.useState(false);
 
+  // Mirror visual preview only for live webcam sources (like a normal selfie camera)
+  const currentSource = sources.find((s) => s.id === activeSource);
+  const isWebcam = currentSource ? currentSource.type === 'webcam' : /^\d+$/.test(activeSource);
+
   const toggleFullscreen = () => {
     if (!videoContainerRef.current) return;
     if (!document.fullscreenElement) {
@@ -154,11 +158,12 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
             ref={videoContainerRef}
             className="relative rounded-2xl overflow-hidden border border-slate-300 bg-slate-950 aspect-video flex items-center justify-center shadow-lg"
           >
-            {/* Live MJPEG Stream */}
+            {/* Live MJPEG Stream (Mirrored for webcam selfie view) */}
             <img
               src="/api/stream"
               alt="Live Fall Detection Stream"
-              className="w-full h-full object-contain select-none"
+              className="w-full h-full object-contain select-none transition-transform duration-200"
+              style={{ transform: isWebcam ? 'scaleX(-1)' : 'none' }}
               onError={(e) => {
                 setTimeout(() => {
                   (e.target as HTMLImageElement).src = `/api/stream?t=${Date.now()}`;

@@ -22,10 +22,9 @@ import asyncio
 import threading
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -100,6 +99,7 @@ class VideoProcessor:
         self.lock = threading.Lock()
         self.running = False
         self.source = "0"  # Real camera index 0
+        self.requested_source: Optional[str] = None
         self.cap: Optional[cv2.VideoCapture] = None
         self.pipeline: Optional[FallDetectionPipeline] = None
 
@@ -130,10 +130,23 @@ class VideoProcessor:
         }
         self.total_occluded_recovered = 0
         self.total_keypoints_evaluated = 0
+        self.stream_fps = 30.0
+        self.inference_fps = 0.0
+        self.frame_lock = threading.Lock()
 
         # Worker threads
         self.capture_thread: Optional[threading.Thread] = None
         self.inference_thread: Optional[threading.Thread] = None
+
+        # Instantiate YOLOv8 Pose detection pipeline once to avoid reloading model weights on source switch
+        print(f"[VideoProcessor] Initializing YOLOv8 Pose Detection Pipeline...")
+        self.pipeline = FallDetectionPipeline(
+            conf_thresh=current_settings.conf_thresh,
+            fps=30.0
+        )
+        for z in active_zones:
+            poly = [(pt[0], pt[1]) for pt in z["polygon"]]
+            self.pipeline.add_furniture_zone(z["name"], poly)
 
     def start(self, source: str = "0"):
         with self.lock:
@@ -175,39 +188,69 @@ class VideoProcessor:
             self.stop_locked()
 
     def set_source(self, new_source: str):
-        # Gracefully switch source without crashing ffmpeg or OpenCV
-        self.start(new_source)
+        # Gracefully request source switch in the capture thread without destroying active camera handles concurrently
+        new_source_str = str(new_source)
+        with self.lock:
+            if self.source == new_source_str and self.cap is not None and self.cap.isOpened():
+                print(f"[VideoProcessor] Source '{new_source_str}' is already active and running.")
+                return
+            print(f"[VideoProcessor] Scheduling source switch to: {new_source_str}")
+            self.requested_source = new_source_str
 
     def _open_camera(self, src: str) -> Optional[cv2.VideoCapture]:
         is_cam = str(src).isdigit()
         if is_cam:
             idx = int(src)
-            print(f"[VideoProcessor] Attempting to open Webcam #{idx}...")
+            print(f"[VideoProcessor] Attempting to open Webcam #{idx} at 640x480 @ 30 FPS...")
             if sys.platform.startswith("win"):
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                try:
+                    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                    if cap.isOpened():
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                        cap.set(cv2.CAP_PROP_FPS, 30)
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        return cap
+                except Exception as e:
+                    print(f"[VideoProcessor] DirectShow capture init warning: {e}")
+
+            try:
+                cap = cv2.VideoCapture(idx)
                 if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     return cap
-
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                return cap
+            except Exception as e:
+                print(f"[VideoProcessor] Default capture init warning: {e}")
 
             # If requested camera index is not available, fall back to Camera 0
             if idx != 0:
                 print(f"[VideoProcessor] Camera #{idx} unavailable. Falling back to Camera #0...")
                 if sys.platform.startswith("win"):
-                    cap0 = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                    try:
+                        cap0 = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                        if cap0.isOpened():
+                            cap0.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                            cap0.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                            cap0.set(cv2.CAP_PROP_FPS, 30)
+                            cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            self.source = "0"
+                            return cap0
+                    except Exception:
+                        pass
+                try:
+                    cap0 = cv2.VideoCapture(0)
                     if cap0.isOpened():
+                        cap0.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                        cap0.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                        cap0.set(cv2.CAP_PROP_FPS, 30)
                         cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                         self.source = "0"
                         return cap0
-                cap0 = cv2.VideoCapture(0)
-                if cap0.isOpened():
-                    cap0.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    self.source = "0"
-                    return cap0
+                except Exception:
+                    pass
 
             return None
         else:
@@ -256,17 +299,36 @@ class VideoProcessor:
         return hud
 
     def _capture_loop(self):
-        """Continuous high-speed camera reader decoupled from model inference."""
+        """Continuous high-speed camera reader rendering overlays at native 30 FPS."""
         reconnect_interval = 1.0
         last_reconnect_attempt = 0.0
+        consecutive_failures = 0
+        frame_timestamps = []
 
         while self.running:
+            # Check for scheduled source change (only this thread releases or opens self.cap)
+            if self.requested_source is not None:
+                new_src = self.requested_source
+                self.requested_source = None
+                print(f"[VideoProcessor] Applying safe source switch to: {new_src}")
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+                self.source = new_src
+                consecutive_failures = 0
+                time.sleep(0.2)
+                continue
+
             if self.cap is None or not self.cap.isOpened():
                 if time.time() - last_reconnect_attempt >= reconnect_interval:
                     last_reconnect_attempt = time.time()
                     self.cap = self._open_camera(self.source)
                     if self.cap and self.cap.isOpened():
                         print(f"[VideoProcessor] Successfully connected to source: {self.source}")
+                        consecutive_failures = 0
                     else:
                         # Display connecting HUD while trying to acquire camera
                         self.latest_vis_frame = self._create_connecting_hud(
@@ -284,53 +346,85 @@ class VideoProcessor:
                 ret, frame = False, None
 
             if not ret or frame is None:
+                consecutive_failures += 1
                 if current_settings.loop_video and not str(self.source).isdigit():
                     try:
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     except Exception:
                         pass
                     time.sleep(0.03)
-                    continue
-                else:
-                    # Camera disconnected or busy
-                    print("[VideoProcessor] Camera feed temporarily interrupted. Re-acquiring...")
-                    if self.cap:
-                        try:
-                            self.cap.release()
-                        except Exception:
-                            pass
-                        self.cap = None
-                    time.sleep(0.5)
+                    consecutive_failures = 0
                     continue
 
-            # Store newest raw frame and notify inference worker
-            self.raw_frame = frame
+                if consecutive_failures < 15:
+                    time.sleep(0.02)
+                    continue
+
+                # Camera disconnected or busy after sustained failures
+                print("[VideoProcessor] Camera feed temporarily interrupted. Re-acquiring...")
+                consecutive_failures = 0
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+                time.sleep(0.5)
+                continue
+
+            consecutive_failures = 0
+
+            # Standardize frame resolution to 640x480 for ultra-fluid processing
+            h, w = frame.shape[:2]
+            if w != 640 or h != 480:
+                frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_AREA)
+
+            # Measure real delivery FPS over rolling window
+            now = time.time()
+            frame_timestamps.append(now)
+            if len(frame_timestamps) > 30:
+                frame_timestamps.pop(0)
+
+            if len(frame_timestamps) >= 2:
+                elapsed = frame_timestamps[-1] - frame_timestamps[0]
+                measured_fps = (len(frame_timestamps) - 1) / max(elapsed, 1e-4)
+                self.stream_fps = round(min(60.0, max(1.0, measured_fps)), 1)
+            else:
+                self.stream_fps = 30.0
+
+            # Store newest raw frame for asynchronous pose inference
+            with self.frame_lock:
+                self.raw_frame = frame
+
             self.new_frame_event.set()
 
-            # Slight yield to avoid pinning 100% CPU on capture
-            if str(self.source).isdigit():
-                time.sleep(0.01)
+            # Render overlay at native 30 FPS so the live video feed is buttery smooth
+            if current_settings.hud_overlay and hasattr(self.pipeline, "render_current"):
+                try:
+                    vis_frame = self.pipeline.render_current(frame, fps_val=self.stream_fps)
+                except Exception:
+                    vis_frame = frame
             else:
-                time.sleep(0.03)
+                vis_frame = frame
+
+            self.latest_vis_frame = vis_frame
+            self.latest_telemetry["fps"] = self.stream_fps
+            self.latest_telemetry["status"] = "LIVE"
+
+            # Rate-limiting for video files or minimal yield for real cameras
+            if not str(self.source).isdigit():
+                time.sleep(1.0 / 30.0)
+            else:
+                time.sleep(0.001)
 
     def _inference_loop(self):
-        """Continuous YOLOv8 pose estimation and kinematic state extraction."""
-        print(f"[VideoProcessor] Initializing YOLOv8 Pose Detection Pipeline...")
-        self.pipeline = FallDetectionPipeline(
-            conf_thresh=current_settings.conf_thresh,
-            fps=30.0
-        )
-
-        for z in active_zones:
-            poly = [(pt[0], pt[1]) for pt in z["polygon"]]
-            self.pipeline.add_furniture_zone(z["name"], poly)
-
+        """Continuous asynchronous YOLOv8 pose estimation and kinematic state extraction."""
         last_time = time.time()
         frame_idx = 0
 
         while self.running:
             # Wait for next frame from capture thread
-            has_new = self.new_frame_event.wait(timeout=0.2)
+            has_new = self.new_frame_event.wait(timeout=0.1)
             self.new_frame_event.clear()
 
             if not self.running:
@@ -339,19 +433,21 @@ class VideoProcessor:
             if not has_new or self.raw_frame is None:
                 continue
 
-            frame = self.raw_frame.copy()
+            with self.frame_lock:
+                frame = self.raw_frame.copy()
+
             frame_idx += 1
             self.total_frames_processed += 1
 
             t_now = time.time()
             dt = t_now - last_time
             last_time = t_now
-            calc_fps = 1.0 / max(dt, 1e-4)
-            self.pipeline.fps = calc_fps
+            calc_inf_fps = 1.0 / max(dt, 1e-4)
+            self.inference_fps = round(calc_inf_fps, 1)
+            self.pipeline.fps = self.stream_fps
 
             try:
                 vis_frame, alerts = self.pipeline.process_frame(frame)
-                self.latest_vis_frame = vis_frame if current_settings.hud_overlay else frame
 
                 # Read real tracklets and kinematic features from pipeline
                 tracklet_data = getattr(self.pipeline, "latest_tracklet_data", {})
@@ -399,15 +495,13 @@ class VideoProcessor:
                         self._handle_fall_alert(alert, vis_frame)
 
                 # Update live telemetry
-                self.latest_telemetry = {
-                    "fps": round(calc_fps, 1),
-                    "status": "LIVE",
-                    "source": self.source,
-                    "frame_index": frame_idx,
-                    "active_tracks_count": len(active_tracks_info),
-                    "tracks": active_tracks_info,
-                    "alerts": alerts
-                }
+                self.latest_telemetry["status"] = "LIVE"
+                self.latest_telemetry["source"] = self.source
+                self.latest_telemetry["frame_index"] = frame_idx
+                self.latest_telemetry["active_tracks_count"] = len(active_tracks_info)
+                self.latest_telemetry["tracks"] = active_tracks_info
+                self.latest_telemetry["alerts"] = alerts
+                self.latest_telemetry["inference_fps"] = self.inference_fps
 
             except Exception as e:
                 print(f"[VideoProcessor] Frame inference warning: {e}")
@@ -483,24 +577,30 @@ def get_health():
     }
 
 
-def generate_mjpeg_stream():
-    """High-speed MJPEG stream yielding latest frames continuously."""
-    blank = np.zeros((480, 640, 3), dtype=np.uint8)
-    while True:
-        frame = processor.latest_vis_frame if processor.latest_vis_frame is not None else blank
-        ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if ret:
-            yield (
-                b'--frame\r\n'
-                b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n'
-            )
-        time.sleep(0.033)
-
-
 @app.get("/api/stream")
-def video_stream():
+async def video_stream(request: Request):
+    """High-speed MJPEG stream yielding latest frames continuously at 30 FPS, resilient to browser reload."""
+    async def stream_generator():
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                frame = processor.latest_vis_frame
+                if frame is None:
+                    frame = blank
+                ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if ret:
+                    yield (
+                        b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n'
+                    )
+                await asyncio.sleep(0.033)
+        except (asyncio.CancelledError, GeneratorExit, Exception):
+            pass
+
     return StreamingResponse(
-        generate_mjpeg_stream(),
+        stream_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 

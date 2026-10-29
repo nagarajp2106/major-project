@@ -40,6 +40,11 @@ class PoseDetector:
     def __init__(self, model_name: str = "yolov8n-pose.pt", conf_thresh: float = 0.35, device: Optional[str] = None):
         self.conf_thresh = conf_thresh
         self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device == "cpu" and hasattr(torch, "set_num_threads"):
+            try:
+                torch.set_num_threads(min(4, os.cpu_count() or 4))
+            except Exception:
+                pass
         print(f"[PoseDetector] Loading {model_name} on device: {self.device}")
         self.model = YOLO(model_name)
 
@@ -48,6 +53,7 @@ class PoseDetector:
             source=frame,
             conf=self.conf_thresh,
             device=self.device,
+            imgsz=320,
             verbose=False
         )
 
@@ -911,6 +917,16 @@ class FallDetectionPipeline:
         self.latest_tracklets = tracklets
         self.latest_tracklet_data = tracklet_data
         return rendered_frame, alerts
+
+    def render_current(self, frame: np.ndarray, fps_val: float = 30.0) -> np.ndarray:
+        """Renders active bounding boxes, posture skeletons, and HUD tags onto a raw frame at 30 FPS."""
+        return self.visualizer.render(
+            frame=frame,
+            tracklets=getattr(self, "latest_tracklets", []),
+            tracklet_data=getattr(self, "latest_tracklet_data", {}),
+            occlusion_zones=self.occlusion_engine.occlusion_zones,
+            fps_val=fps_val
+        )
 
 
 def run_pipeline(
